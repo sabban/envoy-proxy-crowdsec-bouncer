@@ -19,7 +19,6 @@ import (
 	"github.com/kdwils/envoy-proxy-bouncer/recorder"
 	"github.com/kdwils/envoy-proxy-bouncer/template"
 	"github.com/kdwils/envoy-proxy-bouncer/version"
-	"github.com/kdwils/envoy-proxy-bouncer/webhook"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
@@ -223,7 +222,7 @@ func (s *Server) handleCaptchaVerify(w http.ResponseWriter, r *http.Request) {
 	verificationResult, err := s.captcha.VerifyResponse(r.Context(), clientIP, challengeToken, captchaResponse)
 	if err != nil {
 		if verificationResult != nil && !verificationResult.Success {
-			s.logger.Info("captcha verification failed", "error", err)
+			s.logger.Debug("captcha verification failed", "error", err)
 			s.prometheusRecorder.IncCaptchaVerificationsTotal("failure")
 			http.Error(w, verificationResult.Message, http.StatusForbidden)
 			return
@@ -236,7 +235,7 @@ func (s *Server) handleCaptchaVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !verificationResult.Success {
-		s.logger.Info("captcha verification result failed")
+		s.logger.Debug("captcha verification result failed")
 		s.prometheusRecorder.IncCaptchaVerificationsTotal("failure")
 		http.Error(w, verificationResult.Message, http.StatusForbidden)
 		return
@@ -247,13 +246,7 @@ func (s *Server) handleCaptchaVerify(w http.ResponseWriter, r *http.Request) {
 	cookie := s.buildSessionCookie(cookieName, verificationResult.Token)
 	http.SetCookie(w, cookie)
 
-	s.notifier.Notify(r.Context(), webhook.Event{
-		Type:      webhook.EventCaptchaVerified,
-		Timestamp: s.now().UTC(),
-		IP:        clientIP,
-		Action:    "allow",
-		Reason:    "captcha verified",
-	})
+	s.notifier.NotifyCaptchaVerified(r.Context(), clientIP)
 
 	http.Redirect(w, r, session.OriginalURL, http.StatusFound)
 }
@@ -363,39 +356,6 @@ func (s *Server) loggerInterceptor(ctx context.Context, req any, info *grpc.Unar
 	return handler(logger.WithContext(ctx, reqLogger), req)
 }
 
-func (s *Server) buildWebhookEvent(result bouncer.CheckedRequest) webhook.Event {
-	eventType := webhook.EventRequestAllowed
-	switch result.Action {
-	case "allow":
-		eventType = webhook.EventRequestAllowed
-	case "ban", "deny":
-		eventType = webhook.EventRequestBlocked
-	case "captcha":
-		eventType = webhook.EventCaptchaRequired
-	}
-
-	event := webhook.Event{
-		Type:      eventType,
-		Timestamp: s.now().UTC(),
-		IP:        result.IP,
-		Action:    result.Action,
-		Reason:    result.Reason,
-	}
-
-	if result.ParsedRequest != nil {
-		event.Request = &webhook.Request{
-			Method:    result.ParsedRequest.Method,
-			URL:       result.ParsedRequest.URL.String(),
-			Host:      result.ParsedRequest.URL.Host,
-			Scheme:    result.ParsedRequest.URL.Scheme,
-			Path:      result.ParsedRequest.URL.Path,
-			UserAgent: result.ParsedRequest.UserAgent,
-		}
-	}
-
-	return event
-}
-
 func (s *Server) Check(ctx context.Context, req *auth.CheckRequest) (*auth.CheckResponse, error) {
 	defer s.prometheusRecorder.ObserveDuration()()
 
@@ -406,17 +366,17 @@ func (s *Server) Check(ctx context.Context, req *auth.CheckRequest) (*auth.Check
 
 	result := s.bouncer.Check(ctx, req)
 	s.logger.Debug("remediation result", slog.Any("result", result))
-	if result.Action != "error" {
-		s.notifier.Notify(ctx, s.buildWebhookEvent(result))
-	}
+	s.notifier.NotifyCheckedRequest(ctx, result)
 
 	switch result.Action {
 	case "allow":
 		return getAllowedResponse(), nil
 	case "captcha":
 		return getRedirectResponse(result.RedirectURL), nil
+	case "challenge":
+		return getChallengeResponse(httpStatusToEnvoyStatus(result.HTTPStatus), result.ResponseBody, result.ResponseHeaders), nil
 	case "ban":
-		s.logger.Info("request denied", "ip", result.IP, "action", result.Action, "reason", result.Reason)
+		s.logger.Debug("request denied", "ip", result.IP, "action", result.Action, "reason", result.Reason)
 		body, headers := s.renderDeniedResponse(result)
 		return getDeniedResponse(httpStatusToEnvoyStatus(result.HTTPStatus), body, headers), nil
 	case "error":
@@ -526,6 +486,48 @@ func getDeniedResponse(code envoy_type.StatusCode, body string, headers map[stri
 				},
 				Body:    body,
 				Headers: buildHeaderValues(headers),
+			},
+		},
+	}
+}
+
+func buildMultiHeaderValues(headers map[string][]string) []*envoy_core.HeaderValueOption {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	values := make([]*envoy_core.HeaderValueOption, 0, len(headers))
+	for k, vs := range headers {
+		key := k
+		for _, v := range vs {
+			value := v
+			values = append(values, &envoy_core.HeaderValueOption{
+				Header: &envoy_core.HeaderValue{
+					Key:   key,
+					Value: value,
+				},
+			})
+		}
+	}
+
+	return values
+}
+
+// getChallengeResponse passes the AppSec-rendered challenge body, cookies, and
+// headers through to the client verbatim - AppSec already produced the final
+// content (challenge page, PoW worker script, or submission result JSON).
+func getChallengeResponse(code envoy_type.StatusCode, body string, headers map[string][]string) *auth.CheckResponse {
+	return &auth.CheckResponse{
+		Status: &rpc_status.Status{
+			Code: int32(code),
+		},
+		HttpResponse: &auth.CheckResponse_DeniedResponse{
+			DeniedResponse: &auth.DeniedHttpResponse{
+				Status: &envoy_type.HttpStatus{
+					Code: code,
+				},
+				Body:    body,
+				Headers: buildMultiHeaderValues(headers),
 			},
 		},
 	}
